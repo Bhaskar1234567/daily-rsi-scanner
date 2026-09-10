@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
 # ============================================================
@@ -266,42 +267,29 @@ def historical_probability(
     """
     Historical probability model.
 
-    A setup is triggered when daily RSI crosses:
-      - upward through 70 => overbought => hypothetical SHORT
-      - downward through 30 => oversold => hypothetical LONG
+    RSI >70 crossing upward => hypothetical SHORT.
+    RSI <30 crossing downward => hypothetical LONG.
 
-    Entry = close of the setup candle.
-    Target/stop distance = target_mult/stop_mult * rolling average
-    daily range measured BEFORE the setup candle.
+    Entry = setup candle close.
+    Target/stop distance = rolling average daily range measured
+    BEFORE the setup candle.
 
-    For a SHORT:
-      target = entry - target_distance
-      stop   = entry + stop_distance
-
-    For a LONG:
-      target = entry + target_distance
-      stop   = entry - stop_distance
-
-    If both target and stop are touched in the same daily candle,
-    the result is conservatively treated as a LOSS because daily OHLC
-    cannot tell which happened first.
+    If target and stop are both touched in the same daily candle,
+    the result is conservatively counted as a loss.
     """
 
     if len(df) < max(range_days + rsi_period + lookahead + 10, 60):
-        return np.nan, 0
+        return np.nan, 0, 0, 0
 
     d = df.copy()
     d["rsi"] = rsi_wilder(d["close"], rsi_period)
     d["daily_range"] = d["high"] - d["low"]
     d["avg_range"] = d["daily_range"].rolling(range_days).mean()
 
-    wins = 0
-    total = 0
+    outcomes = []
+    start_i = max(range_days + rsi_period + 2, 2)
 
-    # Use only completed historical setup candles.
-    start = max(range_days + rsi_period + 2, 2)
-
-    for i in range(start, len(d) - lookahead):
+    for i in range(start_i, len(d) - lookahead):
         prev_rsi = d.iloc[i - 1]["rsi"]
         cur_rsi = d.iloc[i]["rsi"]
         avg_rng = d.iloc[i - 1]["avg_range"]
@@ -309,14 +297,11 @@ def historical_probability(
         if pd.isna(prev_rsi) or pd.isna(cur_rsi) or pd.isna(avg_rng) or avg_rng <= 0:
             continue
 
-        direction = None
-
         if prev_rsi <= 70 and cur_rsi > 70:
             direction = "SHORT"
         elif prev_rsi >= 30 and cur_rsi < 30:
             direction = "LONG"
-
-        if direction is None:
+        else:
             continue
 
         entry = float(d.iloc[i]["close"])
@@ -343,7 +328,6 @@ def historical_probability(
                 hit_target = lo <= target
                 hit_stop = hi >= stop
 
-            # Conservative when both happen in one candle.
             if hit_target and hit_stop:
                 result = "LOSS"
                 break
@@ -355,15 +339,19 @@ def historical_probability(
                 break
 
         if result is not None:
-            total += 1
-            if result == "WIN":
-                wins += 1
+            outcomes.append(result)
 
-    if total == 0:
-        return np.nan, 0
+        if len(outcomes) >= max_setups:
+            break
 
-    return wins / total * 100.0, total
+    setups = len(outcomes)
+    wins = sum(x == "WIN" for x in outcomes)
+    losses = sum(x == "LOSS" for x in outcomes)
 
+    if setups == 0:
+        return np.nan, wins, losses, setups
+
+    return wins / setups * 100.0, wins, losses, setups
 
 def scan_one(row, rsi_period, range_days, lookahead, target_mult, stop_mult, max_setups):
     symbol = row["symbol"]
@@ -399,7 +387,7 @@ def scan_one(row, rsi_period, range_days, lookahead, target_mult, stop_mult, max
         today_range = float(last["high"] - last["low"])
         range_pct = (today_range / price * 100) if price else np.nan
 
-        prob, setups = historical_probability(
+        prob, wins, losses, setups = historical_probability(
             df,
             rsi_period=rsi_period,
             range_days=range_days,
@@ -420,7 +408,10 @@ def scan_one(row, rsi_period, range_days, lookahead, target_mult, stop_mult, max
             "Today Range": today_range,
             "Range %": range_pct,
             "Win Probability": prob,
+            "Wins": wins,
+            "Losses": losses,
             "Setups": setups,
+            "Liquidity OK": bool(row.get("Liquidity OK", True)),
             "24h Change %": float(row["change"]),
         }
 
@@ -478,9 +469,9 @@ with c9:
 scan = st.button("🔎  SCAN NOW", use_container_width=True, type="primary")
 
 if auto_refresh:
+    st_autorefresh(interval=5 * 60 * 1000, key="daily_rsi_auto_refresh")
     st.markdown(
-        "<div class='small-note'>Auto-refresh is ON. Use your browser/Streamlit refresh control "
-        "or add a Streamlit auto-refresh component if you want timed refreshes.</div>",
+        "<div class='small-note'>🔄 Auto-refresh is ON • every 5 minutes</div>",
         unsafe_allow_html=True
     )
 
@@ -496,7 +487,10 @@ if scan or st.session_state.scan_result is None:
             st.error("Could not load Binance Futures symbols.")
             st.stop()
 
-        universe = universe[universe["volume"] >= min_volume_m * 1_000_000].copy()
+        # Always scan the requested top-N liquidity universe.
+        # Minimum volume is displayed as a liquidity flag instead of
+        # silently reducing a 200-coin scan.
+        universe["Liquidity OK"] = universe["volume"] >= min_volume_m * 1_000_000
 
         results = []
         workers = min(12, max(4, len(universe)))
@@ -631,7 +625,8 @@ def show_table(x, section_class, title, emoji):
     cols = [
         "Coin", "RSI (1D)", "Side", "Price", "24h Volume",
         "Avg Daily Range", "Today Range", "Range %",
-        "Win Probability", "Setups", "24h Change %"
+        "Win Probability", "Wins", "Losses", "Setups",
+        "Liquidity OK", "24h Change %"
     ]
 
     st.dataframe(
