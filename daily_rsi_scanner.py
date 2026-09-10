@@ -8,7 +8,7 @@ from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
 # ============================================================
-# DAILY RSI SCANNER — BINANCE USDT-M FUTURES
+# COINDCX RSI SCANNER — USDT FUTURES
 # Conditions:
 #   1. Daily RSI > 70 or < 30
 #   2. Top/high-liquidity USDT perpetual coins by 24h quote volume
@@ -23,7 +23,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-BASE = "https://fapi.binance.com"
+BASE = "https://api.coindcx.com"
+PUBLIC_BASE = "https://public.coindcx.com"
 
 # ------------------------- STYLE ----------------------------
 
@@ -153,82 +154,144 @@ session.headers.update({"User-Agent": "DailyRSIScanner/1.0"})
 
 @st.cache_data(ttl=60)
 def get_exchange_info():
-    r = session.get(f"{BASE}/fapi/v1/exchangeInfo", timeout=15)
+    """CoinDCX active USDT futures instruments."""
+    url = f"{BASE}/exchange/v1/derivatives/futures/data/active_instruments"
+    r = session.get(url, params={"margin_currency_short_name[]": "USDT"}, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
 @st.cache_data(ttl=60)
 def get_24h_tickers():
-    r = session.get(f"{BASE}/fapi/v1/ticker/24hr", timeout=20)
+    """CoinDCX real-time futures prices and 24h statistics."""
+    url = f"{PUBLIC_BASE}/market_data/v3/current_prices/futures/rt"
+    r = session.get(url, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
 def get_symbols(limit):
-    info = get_exchange_info()
-    tickers = get_24h_tickers()
-
-    valid = {
-        x["symbol"]
-        for x in info["symbols"]
-        if x.get("status") == "TRADING"
-        and x.get("contractType") == "PERPETUAL"
-        and x.get("quoteAsset") == "USDT"
-    }
+    instruments = get_exchange_info()
+    ticker_payload = get_24h_tickers()
+    prices = ticker_payload.get("prices", {})
 
     rows = []
-    for t in tickers:
-        s = t.get("symbol")
-        if s in valid:
-            try:
-                rows.append({
-                    "symbol": s,
-                    "volume": float(t.get("quoteVolume", 0)),
-                    "price": float(t.get("lastPrice", 0)),
-                    "change": float(t.get("priceChangePercent", 0)),
-                })
-            except Exception:
-                pass
+    for pair in instruments:
+        if pair not in prices:
+            continue
+
+        t = prices[pair]
+        try:
+            last_price = float(t.get("ls", 0))
+            volume_base = float(t.get("v", 0))
+            quote_volume = volume_base * last_price
+
+            rows.append({
+                "symbol": pair,
+                "display_symbol": pair.replace("B-", "").replace("_USDT", "USDT"),
+                "volume": quote_volume,
+                "volume_base": volume_base,
+                "price": last_price,
+                "change": float(t.get("pc", 0)),
+            })
+        except (TypeError, ValueError):
+            continue
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    # Top/high-liquidity coins by 24h USDT quote volume.
     return df.sort_values("volume", ascending=False).head(limit).reset_index(drop=True)
 
-
 @st.cache_data(ttl=300)
-def get_klines(symbol, interval="1d", limit=180):
+def get_klines(symbol, timeframe="1D", limit=180):
+    """CoinDCX Futures candles.
+
+    CoinDCX REST futures candles support 1-minute, 5-minute, 1-hour and
+    1-day resolutions. For the 2-minute strategy we fetch 1-minute candles
+    and aggregate them into exact 2-minute OHLCV candles locally.
+    """
+    import time
+
+    now = int(time.time())
+
+    if timeframe == "2m":
+        # Fetch enough 1-minute candles for RSI(34) and a useful short-term
+        # backtest. 1000 is within the normal REST candle limit.
+        one_min_limit = 1000
+        from_ts = now - (one_min_limit + 20) * 60
+        resolution = "1"
+    else:
+        from_ts = now - (limit + 10) * 24 * 60 * 60
+        resolution = "1D"
+
     r = session.get(
-        f"{BASE}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=15,
+        f"{PUBLIC_BASE}/market_data/candlesticks",
+        params={
+            "pair": symbol,
+            "from": from_ts,
+            "to": now,
+            "resolution": resolution,
+            "pcode": "f",
+        },
+        timeout=25,
     )
     r.raise_for_status()
-    raw = r.json()
+    payload = r.json()
+    raw = payload.get("data", [])
 
-    cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ]
-    df = pd.DataFrame(raw, columns=cols)
+    if not raw:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(raw)
 
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["time"] = pd.to_numeric(df["time"], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
+    df = df.dropna(subset=["open", "high", "low", "close", "open_time"])
 
-    # Do not use the currently-forming daily candle.
+    if timeframe == "2m":
+        # Floor each 1-minute candle to a 2-minute bucket and aggregate OHLCV.
+        df["bucket"] = df["open_time"].dt.floor("2min")
+        grouped = df.groupby("bucket", as_index=False)
+        counts = grouped.size().rename(columns={"size": "minute_count"})
+        df = (
+            grouped
+            .agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            })
+            .rename(columns={"bucket": "open_time"})
+            .merge(counts, on="open_time", how="left")
+        )
+        # Keep only complete 2-minute candles.
+        df = df[df["minute_count"] == 2].drop(columns=["minute_count"])
+        df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
+        df = df.sort_values("open_time").reset_index(drop=True)
+
+        # Remove the currently forming 2-minute candle.
+        now_utc = pd.Timestamp.now(tz="UTC")
+        if len(df) > 1:
+            last_open = df.iloc[-1]["open_time"]
+            if now_utc < last_open + pd.Timedelta(minutes=2):
+                df = df.iloc[:-1].copy()
+
+        return df.tail(limit).reset_index(drop=True)
+
+    # Remove the currently forming daily candle.
     if len(df) > 1:
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        if int(raw[-1][0]) <= now_ms < int(raw[-1][6]):
+        now_utc = pd.Timestamp.now(tz="UTC")
+        last_open = df.iloc[-1]["open_time"]
+        if now_utc < last_open + pd.Timedelta(days=1):
             df = df.iloc[:-1].copy()
 
-    return df.reset_index(drop=True)
-
+    return df.tail(limit).reset_index(drop=True)
 
 def rsi_wilder(close, period=14):
     delta = close.diff()
@@ -257,39 +320,32 @@ def average_daily_range(df, days):
 
 def historical_probability(
     df,
-    rsi_period=14,
+    rsi_period=34,
     range_days=20,
     lookahead=3,
     target_mult=1.0,
     stop_mult=1.0,
     max_setups=100,
 ):
-    """
-    Historical probability model.
-
-    RSI >70 crossing upward => hypothetical SHORT.
-    RSI <30 crossing downward => hypothetical LONG.
-
-    Entry = setup candle close.
-    Target/stop distance = rolling average daily range measured
-    BEFORE the setup candle.
-
-    If target and stop are both touched in the same daily candle,
-    the result is conservatively counted as a loss.
-    """
+    """Historical probability model for the selected timeframe."""
 
     if len(df) < max(range_days + rsi_period + lookahead + 10, 60):
         return np.nan, 0, 0, 0
 
     d = df.copy()
     d["rsi"] = rsi_wilder(d["close"], rsi_period)
-    d["daily_range"] = d["high"] - d["low"]
-    d["avg_range"] = d["daily_range"].rolling(range_days).mean()
+    d["candle_range"] = d["high"] - d["low"]
+    d["avg_range"] = d["candle_range"].rolling(range_days).mean()
 
-    outcomes = []
-    start_i = max(range_days + rsi_period + 2, 2)
+    wins = 0
+    losses = 0
+    setups = 0
+    start = max(range_days + rsi_period + 2, 2)
 
-    for i in range(start_i, len(d) - lookahead):
+    for i in range(start, len(d) - lookahead):
+        if setups >= max_setups:
+            break
+
         prev_rsi = d.iloc[i - 1]["rsi"]
         cur_rsi = d.iloc[i]["rsi"]
         avg_rng = d.iloc[i - 1]["avg_range"]
@@ -297,11 +353,13 @@ def historical_probability(
         if pd.isna(prev_rsi) or pd.isna(cur_rsi) or pd.isna(avg_rng) or avg_rng <= 0:
             continue
 
+        direction = None
         if prev_rsi <= 70 and cur_rsi > 70:
             direction = "SHORT"
         elif prev_rsi >= 30 and cur_rsi < 30:
             direction = "LONG"
-        else:
+
+        if direction is None:
             continue
 
         entry = float(d.iloc[i]["close"])
@@ -316,7 +374,6 @@ def historical_probability(
             stop = entry + stop_dist
 
         result = None
-
         for j in range(i + 1, i + 1 + lookahead):
             hi = float(d.iloc[j]["high"])
             lo = float(d.iloc[j]["low"])
@@ -339,35 +396,35 @@ def historical_probability(
                 break
 
         if result is not None:
-            outcomes.append(result)
-
-        if len(outcomes) >= max_setups:
-            break
-
-    setups = len(outcomes)
-    wins = sum(x == "WIN" for x in outcomes)
-    losses = sum(x == "LOSS" for x in outcomes)
+            setups += 1
+            if result == "WIN":
+                wins += 1
+            else:
+                losses += 1
 
     if setups == 0:
         return np.nan, wins, losses, setups
 
     return wins / setups * 100.0, wins, losses, setups
 
-def scan_one(row, rsi_period, range_days, lookahead, target_mult, stop_mult, max_setups):
+
+def scan_one(
+    row, timeframe, timeframe_label, rsi_period, range_days, lookahead,
+    target_mult, stop_mult, max_setups, candle_limit
+):
     symbol = row["symbol"]
 
     try:
-        df = get_klines(symbol, "1d", 180)
+        df = get_klines(symbol, timeframe, candle_limit)
 
         if len(df) < max(range_days + rsi_period + 5, 40):
             return None
 
         df["rsi"] = rsi_wilder(df["close"], rsi_period)
-        df["daily_range"] = df["high"] - df["low"]
-        df["avg_range"] = df["daily_range"].rolling(range_days).mean()
+        df["candle_range"] = df["high"] - df["low"]
+        df["avg_range"] = df["candle_range"].rolling(range_days).mean()
 
         last = df.iloc[-1]
-
         rsi = float(last["rsi"])
         price = float(last["close"])
         avg_range = float(last["avg_range"])
@@ -384,8 +441,8 @@ def scan_one(row, rsi_period, range_days, lookahead, target_mult, stop_mult, max
         else:
             return None
 
-        today_range = float(last["high"] - last["low"])
-        range_pct = (today_range / price * 100) if price else np.nan
+        current_range = float(last["high"] - last["low"])
+        range_pct = (current_range / price * 100) if price else np.nan
 
         prob, wins, losses, setups = historical_probability(
             df,
@@ -398,21 +455,21 @@ def scan_one(row, rsi_period, range_days, lookahead, target_mult, stop_mult, max
         )
 
         return {
-            "Coin": symbol,
-            "RSI (1D)": rsi,
+            "Coin": str(row.get("display_symbol", symbol)),
+            "RSI": rsi,
             "Signal": status,
             "Side": side,
             "Price": price,
             "24h Volume": float(row["volume"]),
-            "Avg Daily Range": avg_range,
-            "Today Range": today_range,
+            "Avg Range": avg_range,
+            "Current Range": current_range,
             "Range %": range_pct,
             "Win Probability": prob,
             "Wins": wins,
             "Losses": losses,
             "Setups": setups,
-            "Liquidity OK": bool(row.get("Liquidity OK", True)),
             "24h Change %": float(row["change"]),
+            "Timeframe": timeframe_label,
         }
 
     except Exception:
@@ -423,12 +480,30 @@ def scan_one(row, rsi_period, range_days, lookahead, target_mult, stop_mult, max
 
 st.markdown("""
 <div class="hero">
-    <h1>📊 Daily RSI Scanner</h1>
-    <p>High Liquidity Coins • Daily Timeframe • RSI Extremes • Historical Win Probability</p>
+    <h1>📊 CoinDCX RSI Scanner</h1>
+    <p>High Liquidity Futures • Select 2M or 1D • RSI 34 Extremes • Historical Win Probability</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ------------------------- CONTROLS -------------------------
+
+strategy = st.selectbox(
+    "Strategy",
+    ["2M RSI 34", "1D RSI 34"],
+    index=1,
+    help="2M uses CoinDCX 1-minute futures candles aggregated into 2-minute candles."
+)
+
+if strategy == "2M RSI 34":
+    timeframe = "2m"
+    timeframe_label = "2M"
+    candle_limit = 1000
+else:
+    timeframe = "1D"
+    timeframe_label = "1D"
+    candle_limit = 180
+
+rsi_period = 34
 
 c1, c2, c3, c4, c5 = st.columns([1.3, 1, .8, 1, 1.3])
 
@@ -436,7 +511,7 @@ with c1:
     coin_limit = st.selectbox("No. of Coins", [30, 50, 100, 150, 200], index=4)
 
 with c2:
-    rsi_period = st.number_input("RSI Period", min_value=2, max_value=50, value=14, step=1)
+    st.number_input("RSI Period", min_value=34, max_value=34, value=34, disabled=True)
 
 with c3:
     range_days = st.selectbox("Avg Range", [7, 14, 20, 30], index=2)
@@ -446,7 +521,7 @@ with c4:
 
 with c5:
     min_volume_m = st.number_input(
-        "Min 24h Volume ($M)",
+        "Min 24h Turnover ($M)",
         min_value=0.0,
         value=50.0,
         step=10.0
@@ -479,18 +554,15 @@ if auto_refresh:
 if "scan_result" not in st.session_state:
     st.session_state.scan_result = None
 
-if scan or st.session_state.scan_result is None:
-    with st.spinner("Loading high-liquidity Binance Futures coins and scanning daily candles..."):
+if scan or st.session_state.scan_result is None or st.session_state.get("last_strategy") != strategy:
+    with st.spinner(f"Scanning CoinDCX Futures using {strategy}..."):
         universe = get_symbols(coin_limit)
 
         if universe.empty:
-            st.error("Could not load Binance Futures symbols.")
+            st.error("Could not load CoinDCX Futures symbols.")
             st.stop()
 
-        # Always scan the requested top-N liquidity universe.
-        # Minimum volume is displayed as a liquidity flag instead of
-        # silently reducing a 200-coin scan.
-        universe["Liquidity OK"] = universe["volume"] >= min_volume_m * 1_000_000
+        universe = universe[universe["volume"] >= min_volume_m * 1_000_000].copy()
 
         results = []
         workers = min(12, max(4, len(universe)))
@@ -500,12 +572,15 @@ if scan or st.session_state.scan_result is None:
                 executor.submit(
                     scan_one,
                     row,
+                    timeframe,
+                    timeframe_label,
                     rsi_period,
                     range_days,
                     lookahead,
                     target_mult,
                     stop_mult,
                     max_setups,
+                    candle_limit,
                 )
                 for _, row in universe.iterrows()
             ]
@@ -519,7 +594,7 @@ if scan or st.session_state.scan_result is None:
 
         if not result_df.empty:
             result_df = result_df.sort_values(
-                ["Win Probability", "RSI (1D)"],
+                ["Win Probability", "RSI"],
                 ascending=[False, False],
                 na_position="last"
             ).reset_index(drop=True)
@@ -528,15 +603,15 @@ if scan or st.session_state.scan_result is None:
             "df": result_df,
             "scanned": len(universe),
             "updated": datetime.now().strftime("%d %b %Y %H:%M:%S"),
+            "strategy": strategy,
         }
+        st.session_state.last_strategy = strategy
 
 data = st.session_state.scan_result
 df = data["df"]
 
-# ------------------------- SUMMARY --------------------------
-
-above = df[df["RSI (1D)"] > 70].copy() if not df.empty else pd.DataFrame()
-below = df[df["RSI (1D)"] < 30].copy() if not df.empty else pd.DataFrame()
+above = df[df["RSI"] > 70].copy() if not df.empty else pd.DataFrame()
+below = df[df["RSI"] < 30].copy() if not df.empty else pd.DataFrame()
 valid_prob = df["Win Probability"].dropna() if not df.empty else pd.Series(dtype=float)
 
 m1, m2, m3, m4 = st.columns(4)
@@ -546,7 +621,7 @@ with m1:
     <div class="metric-card">
         <div class="metric-title">💧 Coins Scanned</div>
         <div class="metric-value blue">{data["scanned"]}</div>
-        <div class="metric-sub">Top liquidity by 24h quote volume</div>
+        <div class="metric-sub">Top liquidity by estimated 24h USDT turnover</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -575,16 +650,19 @@ with m4:
     <div class="metric-card">
         <div class="metric-title">🎯 Avg Win Probability</div>
         <div class="metric-value yellow">{prob_text}</div>
-        <div class="metric-sub">Historical setup estimate</div>
+        <div class="metric-sub">Historical {strategy} setup estimate</div>
     </div>
     """, unsafe_allow_html=True)
 
-st.caption(
-    f"Last updated: {data['updated']} • Binance USDT-M Perpetuals • "
-    f"Current daily candle excluded from RSI/range calculations."
+st.markdown(
+    '<div class="small-note">Data source: CoinDCX Futures public market-data API</div>',
+    unsafe_allow_html=True
 )
 
-# ------------------------- TABLE ----------------------------
+st.caption(
+    f"Strategy: {strategy} • RSI 34 • Last updated: {data['updated']} • "
+    f"CoinDCX USDT Futures • Completed {timeframe_label} candles used."
+)
 
 def show_table(x, section_class, title, emoji):
     if x.empty:
@@ -602,31 +680,23 @@ def show_table(x, section_class, title, emoji):
     """, unsafe_allow_html=True)
 
     view = x.copy()
-
     view["Price"] = view["Price"].map(lambda v: f"{v:,.8f}".rstrip("0").rstrip("."))
     view["24h Volume"] = view["24h Volume"].map(
         lambda v: f"${v/1e9:.2f}B" if v >= 1e9 else f"${v/1e6:.1f}M"
     )
-    view["Avg Daily Range"] = view["Avg Daily Range"].map(
-        lambda v: f"{v:,.8f}".rstrip("0").rstrip(".")
-    )
-    view["Today Range"] = view["Today Range"].map(
-        lambda v: f"{v:,.8f}".rstrip("0").rstrip(".")
-    )
+    view["Avg Range"] = view["Avg Range"].map(lambda v: f"{v:,.8f}".rstrip("0").rstrip("."))
+    view["Current Range"] = view["Current Range"].map(lambda v: f"{v:,.8f}".rstrip("0").rstrip("."))
     view["Range %"] = view["Range %"].map(lambda v: f"{v:.2f}%")
-
-    def prob(v):
-        return "—" if pd.isna(v) else f"{v:.1f}%"
-
-    view["Win Probability"] = view["Win Probability"].map(prob)
-    view["RSI (1D)"] = view["RSI (1D)"].map(lambda v: f"{v:.1f}")
+    view["Win Probability"] = view["Win Probability"].map(
+        lambda v: "—" if pd.isna(v) else f"{v:.1f}%"
+    )
+    view["RSI"] = view["RSI"].map(lambda v: f"{v:.1f}")
     view["24h Change %"] = view["24h Change %"].map(lambda v: f"{v:+.2f}%")
 
     cols = [
-        "Coin", "RSI (1D)", "Side", "Price", "24h Volume",
-        "Avg Daily Range", "Today Range", "Range %",
-        "Win Probability", "Wins", "Losses", "Setups",
-        "Liquidity OK", "24h Change %"
+        "Coin", "RSI", "Side", "Price", "24h Volume",
+        "Avg Range", "Current Range", "Range %",
+        "Win Probability", "Wins", "Losses", "Setups", "24h Change %"
     ]
 
     st.dataframe(
@@ -639,30 +709,46 @@ def show_table(x, section_class, title, emoji):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-show_table(above, "section-red", "RSI ABOVE 70  •  Overbought", "🔥")
-show_table(below, "section-green", "RSI BELOW 30  •  Oversold", "🌱")
+show_table(above, "section-red", f"{strategy}  •  RSI ABOVE 70", "🔥")
+show_table(below, "section-green", f"{strategy}  •  RSI BELOW 30", "🌱")
 
 # ------------------------- EXPLANATION ----------------------
+
+with st.expander("🟦 CoinDCX data source"):
+    st.markdown("""
+The scanner uses CoinDCX Futures public market-data endpoints for:
+- Active USDT futures instruments
+- Current futures prices and 24h statistics
+- Futures candlesticks
+
+No CoinDCX API key is required for these public market-data calls.
+
+**2M strategy:** CoinDCX's REST futures candle endpoint provides 1-minute
+candles, so the scanner combines consecutive 1-minute candles into 2-minute
+OHLCV candles before calculating RSI 34.
+""")
 
 with st.expander("🎯 How Win Probability is calculated"):
     st.markdown(f"""
 **Historical probability — not a guaranteed future win rate.**
 
-- A setup is created when daily RSI **crosses above 70** or **crosses below 30**.
-- RSI > 70 is treated as a hypothetical **SHORT** setup.
-- RSI < 30 is treated as a hypothetical **LONG** setup.
+- Current strategy: **{strategy}**.
+- RSI period is fixed at **34**.
+- A setup is created when RSI **crosses above 70** or **crosses below 30**.
+- RSI > 70 = hypothetical **SHORT**.
+- RSI < 30 = hypothetical **LONG**.
 - Entry = close of the RSI signal candle.
-- Target = **{target_mult:.2f} × {range_days}D Average Daily Range**.
-- Stop = **{stop_mult:.2f} × {range_days}D Average Daily Range**.
-- Outcome is checked over the next **{lookahead} completed daily candles**.
-- If both target and stop occur in the same candle, it is conservatively counted as a **loss** because daily OHLC cannot determine which happened first.
-- Only completed daily candles are used.
+- Target = **{target_mult:.2f} × {range_days} candle Average Range**.
+- Stop = **{stop_mult:.2f} × {range_days} candle Average Range**.
+- Outcome is checked over the next **{lookahead} completed {timeframe_label} candles**.
+- If target and stop occur in the same candle, it is conservatively counted as a **loss**.
+- The table shows **Wins / Losses / Setups** so small samples are visible.
 """)
 
-with st.expander("📐 Average Daily Range"):
+with st.expander("📐 Average Range"):
     st.markdown(
-        f"**{range_days}D Average Daily Range = average(High − Low) over the previous "
-        f"{range_days} completed daily candles.**"
+        f"**{range_days} {timeframe_label} candle Average Range = average(High − Low) over the previous "
+        f"{range_days} completed {timeframe_label} candles.**"
     )
 
 st.markdown("""
