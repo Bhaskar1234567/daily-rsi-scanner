@@ -28,8 +28,18 @@ def get_symbols(limit=200):
     r = SESSION.get(url, params={"margin_currency_short_name[]": "USDT"}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
+
+    # CoinDCX may return the instruments directly as a list OR inside
+    # a dictionary such as {"data": [...]}.
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("instruments") or data.get("result") or []
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected active-instruments response from CoinDCX.")
+
     rows = []
     for x in data:
+        if not isinstance(x, dict):
+            continue
         pair = x.get("pair") or x.get("symbol")
         if not pair or not str(pair).endswith("_USDT"):
             continue
@@ -50,9 +60,12 @@ def get_symbols(limit=200):
 
 
 def _parse_candles(data):
-    rows = data.get("data", data) if isinstance(data, dict) else data
+    if isinstance(data, dict):
+        rows = data.get("data") or data.get("candles") or data.get("result") or []
+    else:
+        rows = data
     if not isinstance(rows, list):
-        raise RuntimeError("Unexpected candle response.")
+        raise RuntimeError("Unexpected candle response from CoinDCX.")
     out = []
     for x in rows:
         if isinstance(x, dict):
@@ -97,6 +110,8 @@ def get_klines(pair, timeframe, limit=500):
         r.raise_for_status()
         raw = _parse_candles(r.json())
         raw["bucket"] = raw["time"].dt.floor(f"{bucket}min")
+        current_bucket = pd.Timestamp.now(tz="UTC").floor(f"{bucket}min")
+        raw = raw[raw["bucket"] < current_bucket]
         df = raw.groupby("bucket", sort=True).agg(
             open=("open", "first"), high=("high", "max"), low=("low", "min"),
             close=("close", "last"), volume=("volume", "sum"), count=("close", "size")
@@ -302,7 +317,7 @@ if scan_now or st.session_state.scan_signature != signature:
         st.session_state.scan_signature = signature
         st.session_state.last_scan_info = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception as e:
-        st.error(f"Scanner error: {e}")
+        st.error(f"Scanner error: {type(e).__name__}: {e}")
 
 st.title("📈 CoinDCX Strategy Scanner")
 st.caption("Simple live scanner • 📊 Show Chart below • ↗ CoinDCX opens a new tab")
