@@ -353,7 +353,7 @@ if scan_now or st.session_state.scan_signature != signature:
         st.error(f"Scanner error: {type(e).__name__}: {e}")
 
 st.title("📈 CoinDCX Strategy Scanner")
-st.caption("Simple live scanner • 📊 Show Chart below • ↗ CoinDCX opens a new tab")
+st.caption("Simple live scanner • 📊 Show Chart below • ↗ External chart opens in a new tab")
 
 df = st.session_state.results.copy()
 if not df.empty:
@@ -395,8 +395,16 @@ if not df.empty:
                 else:
                     st.session_state.watchlist.append(coin)
                 st.rerun()
+            if strategy == "2M RSI":
+                external_url = f"https://coindcx.com/futures/{pair}"
+                external_label = "↗ Open CoinDCX Futures"
+            else:
+                tv_symbol = pair.replace("B-", "").replace("_USDT", "") + "USDT"
+                tv_interval = "1D" if strategy == "1D RSI" else "3"
+                external_url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{tv_symbol}&interval={tv_interval}"
+                external_label = "↗ Open TradingView"
             st.markdown(
-                f'<a href="https://coindcx.com/futures/{pair}" target="_blank">↗ Open CoinDCX Futures</a>',
+                f'<a href="{external_url}" target="_blank">{external_label}</a>',
                 unsafe_allow_html=True
             )
 
@@ -414,8 +422,16 @@ if st.session_state.selected_coin:
     st.divider()
     h1, h2 = st.columns([5, 2])
     h1.subheader(f"📊 {coin} — {strategy}")
+    if strategy == "2M RSI":
+        chart_external_url = f"https://coindcx.com/futures/{pair}"
+        chart_external_label = "↗ Open CoinDCX Futures"
+    else:
+        tv_symbol = pair.replace("B-", "").replace("_USDT", "") + "USDT"
+        tv_interval = "1D" if strategy == "1D RSI" else "3"
+        chart_external_url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{tv_symbol}&interval={tv_interval}"
+        chart_external_label = "↗ Open TradingView"
     h2.markdown(
-        f'<a href="https://coindcx.com/futures/{pair}" target="_blank">↗ Open CoinDCX in New Tab</a>',
+        f'<a href="{chart_external_url}" target="_blank">{chart_external_label}</a>',
         unsafe_allow_html=True
     )
     if st.button("✕ Close Chart"):
