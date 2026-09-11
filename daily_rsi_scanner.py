@@ -25,38 +25,71 @@ TIMEOUT = 12
 @st.cache_data(ttl=300, show_spinner=False)
 def get_symbols(limit=200):
     url = f"{BASE}/exchange/v1/derivatives/futures/data/active_instruments"
-    r = SESSION.get(url, params={"margin_currency_short_name[]": "USDT"}, timeout=TIMEOUT)
+    r = SESSION.get(
+        url,
+        params={"margin_currency_short_name[]": "USDT"},
+        timeout=TIMEOUT,
+    )
     r.raise_for_status()
     data = r.json()
 
-    # CoinDCX may return the instruments directly as a list OR inside
-    # a dictionary such as {"data": [...]}.
+    # CoinDCX documents this endpoint as returning pair strings such as
+    # B-BTC_USDT, not dictionaries containing price/volume.
     if isinstance(data, dict):
         data = data.get("data") or data.get("instruments") or data.get("result") or []
     if not isinstance(data, list):
         raise RuntimeError("Unexpected active-instruments response from CoinDCX.")
 
+    pairs = []
+    for item in data:
+        if isinstance(item, str):
+            pair = item
+        elif isinstance(item, dict):
+            pair = item.get("pair") or item.get("symbol")
+        else:
+            pair = None
+        if pair and str(pair).endswith("_USDT"):
+            pairs.append(str(pair))
+
+    if not pairs:
+        raise RuntimeError("CoinDCX returned no active USDT futures pairs.")
+
+    # CoinDCX current futures prices endpoint supplies:
+    # ls = last price, v = 24h quantity volume.
+    pr = SESSION.get(
+        f"{PUBLIC_BASE}/market_data/v3/current_prices/futures/rt",
+        timeout=TIMEOUT,
+    )
+    pr.raise_for_status()
+    pdata = pr.json()
+    prices = pdata.get("prices", {}) if isinstance(pdata, dict) else {}
+
     rows = []
-    for x in data:
-        if not isinstance(x, dict):
-            continue
-        pair = x.get("pair") or x.get("symbol")
-        if not pair or not str(pair).endswith("_USDT"):
-            continue
-        last = float(x.get("last_price") or x.get("lastPrice") or 0)
-        vol = float(x.get("volume_base") or x.get("volume") or 0)
+    for pair in pairs:
+        obj = prices.get(pair, {})
+        if not isinstance(obj, dict):
+            obj = {}
+        try:
+            last = float(obj.get("ls") or 0)
+        except Exception:
+            last = 0.0
+        try:
+            vol = float(obj.get("v") or 0)
+        except Exception:
+            vol = 0.0
+
         rows.append({
-            "Pair": str(pair),
-            "Coin": str(pair).replace("B-", "").replace("_USDT", ""),
+            "Pair": pair,
+            "Coin": pair.replace("B-", "").replace("_USDT", ""),
             "24h Volume": vol,
             "Last": last,
             "Turnover": vol * last,
         })
-    if not rows:
-        raise RuntimeError("No active USDT futures instruments returned by CoinDCX.")
+
     return pd.DataFrame(rows).drop_duplicates("Pair").sort_values(
-        "Turnover", ascending=False
+        "Turnover", ascending=False, na_position="last"
     ).head(int(limit)).reset_index(drop=True)
+
 
 
 def _parse_candles(data):
