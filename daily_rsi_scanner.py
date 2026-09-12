@@ -23,11 +23,11 @@ TIMEOUT = 10
 RSI_2M_CANDLES = 140
 RSI_1D_CANDLES = 90
 OHLC_3M_CANDLES = 500
-SCAN_WORKERS_RSI = 16
-SCAN_WORKERS_OHLC = 12
+SCAN_WORKERS_RSI = 24
+SCAN_WORKERS_OHLC = 18
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_symbols(limit=200):
     url = f"{BASE}/exchange/v1/derivatives/futures/data/active_instruments"
     r = SESSION.get(url, params={"margin_currency_short_name[]": "USDT"}, timeout=TIMEOUT)
@@ -123,7 +123,7 @@ def _parse_candles(data):
     ).sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def get_klines(pair, timeframe, limit=500):
     now = int(time.time())
     url = f"{PUBLIC_BASE}/market_data/candlesticks"
@@ -317,7 +317,7 @@ with st.sidebar:
     strategy = st.selectbox("Strategy", ["2M RSI", "1D RSI", "3M Previous-Day OHLC"])
 
     st.subheader("Coin Scan")
-    top_coins = st.number_input("Top Coins", 10, 200, 200, 10)
+    top_coins = st.number_input("Top Coins", 10, 500, 300, 10)
     volume_filter = st.toggle("Volume Filter", False)
     min_volume_m = st.number_input("Minimum 24h Volume ($M)", 0.0, 10000.0, 10.0, 1.0) if volume_filter else 0.0
 
@@ -400,8 +400,8 @@ if not df.empty:
             c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2, 1.4, 1])
             c1.write(f"**{coin}**")
             if ohlc:
-                c2.write(f"UP **{row['UP Level']:,.6g}**")
-                c3.write(f"DOWN **{row['DOWN Level']:,.6g}**")
+                c2.write(f"UP **{row['LONG Level']:,.6g}**")
+                c3.write(f"DOWN **{row['SHORT Level']:,.6g}**")
                 c4.write(f"Price **{row['Price']:,.6g}**")
             else:
                 c2.write(f"RSI **{row['RSI']:.2f}**")
@@ -417,8 +417,14 @@ if not df.empty:
                 else:
                     st.session_state.watchlist.append(coin)
                 st.rerun()
+            if strategy == "3M Previous-Day OHLC":
+                external_url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{coin}USDT&interval=3"
+                external_text = "↗ Open TradingView 3m"
+            else:
+                external_url = f"https://coindcx.com/futures/{pair}"
+                external_text = "↗ Open CoinDCX Futures"
             st.markdown(
-                f'<a href="https://coindcx.com/futures/{pair}" target="_blank">↗ Open CoinDCX Futures</a>',
+                f'<a href="{external_url}" target="_blank">{external_text}</a>',
                 unsafe_allow_html=True
             )
 
@@ -436,8 +442,18 @@ if st.session_state.selected_coin:
     st.divider()
     h1, h2 = st.columns([5, 2])
     h1.subheader(f"📊 {coin} — {strategy}")
+    if strategy == "3M Previous-Day OHLC":
+        chart_url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{coin}USDT&interval=3"
+        chart_link_text = "↗ TradingView 3m"
+    elif strategy == "1D RSI":
+        chart_url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{coin}USDT&interval=1D"
+        chart_link_text = "↗ TradingView 1D"
+    else:
+        chart_url = f"https://coindcx.com/futures/{pair}"
+        chart_link_text = "↗ CoinDCX Futures"
+
     h2.markdown(
-        f'<a href="https://coindcx.com/futures/{pair}" target="_blank">↗ Open CoinDCX in New Tab</a>',
+        f'<a href="{chart_url}" target="_blank">{chart_link_text}</a>',
         unsafe_allow_html=True
     )
     if st.button("✕ Close Chart"):
@@ -466,10 +482,10 @@ if st.session_state.selected_coin:
             x = chart["df"]
             fig = go.Figure(go.Candlestick(x=x.time, open=x.open, high=x.high,
                                            low=x.low, close=x.close, name="3M Price"))
-            fig.add_hline(y=chart["long"], line_dash="dash",
-                          annotation_text=f"UP {chart['up']:,.6g}")
-            fig.add_hline(y=chart["short"], line_dash="dash",
-                          annotation_text=f"DOWN {chart['down']:,.6g}")
+            fig.add_hline(y=chart["long"], line_dash="dash", line_color="red",
+                          annotation_text=f"LONG / UP {chart['long']:,.6g}")
+            fig.add_hline(y=chart["short"], line_dash="dash", line_color="green",
+                          annotation_text=f"SHORT / DOWN {chart['short']:,.6g}")
             fig.update_layout(height=720, margin=dict(l=10,r=10,t=40,b=10),
                               xaxis_rangeslider_visible=False,
                               title=f"3M Previous-Day OHLC • Previous day {chart['prev'].strftime('%Y-%m-%d')}")
