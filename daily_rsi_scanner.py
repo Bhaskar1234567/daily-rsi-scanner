@@ -1,4 +1,4 @@
-# CoinDCX Strategy Scanner
+# CoinDCX Strategy Scanner - Fast v3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -19,86 +19,45 @@ BASE = "https://api.coindcx.com"
 PUBLIC_BASE = "https://public.coindcx.com"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "CoinDCX-Strategy-Scanner/1.0"})
-TIMEOUT = 12
+TIMEOUT = 10
+RSI_2M_CANDLES = 140
+RSI_1D_CANDLES = 90
+OHLC_3M_CANDLES = 500
+SCAN_WORKERS_RSI = 16
+SCAN_WORKERS_OHLC = 12
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_symbols(limit=200):
     url = f"{BASE}/exchange/v1/derivatives/futures/data/active_instruments"
-    r = SESSION.get(
-        url,
-        params={"margin_currency_short_name[]": "USDT"},
-        timeout=TIMEOUT,
-    )
+    r = SESSION.get(url, params={"margin_currency_short_name[]": "USDT"}, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
-
-    # CoinDCX documents this endpoint as returning pair strings such as
-    # B-BTC_USDT, not dictionaries containing price/volume.
-    if isinstance(data, dict):
-        data = data.get("data") or data.get("instruments") or data.get("result") or []
-    if not isinstance(data, list):
-        raise RuntimeError("Unexpected active-instruments response from CoinDCX.")
-
-    pairs = []
-    for item in data:
-        if isinstance(item, str):
-            pair = item
-        elif isinstance(item, dict):
-            pair = item.get("pair") or item.get("symbol")
-        else:
-            pair = None
-        if pair and str(pair).endswith("_USDT"):
-            pairs.append(str(pair))
-
-    if not pairs:
-        raise RuntimeError("CoinDCX returned no active USDT futures pairs.")
-
-    # CoinDCX current futures prices endpoint supplies:
-    # ls = last price, v = 24h quantity volume.
-    pr = SESSION.get(
-        f"{PUBLIC_BASE}/market_data/v3/current_prices/futures/rt",
-        timeout=TIMEOUT,
-    )
-    pr.raise_for_status()
-    pdata = pr.json()
-    prices = pdata.get("prices", {}) if isinstance(pdata, dict) else {}
-
     rows = []
-    for pair in pairs:
-        obj = prices.get(pair, {})
-        if not isinstance(obj, dict):
-            obj = {}
-        try:
-            last = float(obj.get("ls") or 0)
-        except Exception:
-            last = 0.0
-        try:
-            vol = float(obj.get("v") or 0)
-        except Exception:
-            vol = 0.0
-
+    for x in data:
+        pair = x.get("pair") or x.get("symbol")
+        if not pair or not str(pair).endswith("_USDT"):
+            continue
+        last = float(x.get("last_price") or x.get("lastPrice") or 0)
+        vol = float(x.get("volume_base") or x.get("volume") or 0)
         rows.append({
-            "Pair": pair,
-            "Coin": pair.replace("B-", "").replace("_USDT", ""),
+            "Pair": str(pair),
+            "Coin": str(pair).replace("B-", "").replace("_USDT", ""),
             "24h Volume": vol,
             "Last": last,
             "Turnover": vol * last,
         })
-
+    if not rows:
+        raise RuntimeError("No active USDT futures instruments returned by CoinDCX.")
     return pd.DataFrame(rows).drop_duplicates("Pair").sort_values(
-        "Turnover", ascending=False, na_position="last"
+        "Turnover", ascending=False
     ).head(int(limit)).reset_index(drop=True)
 
 
-
 def _parse_candles(data):
-    if isinstance(data, dict):
-        rows = data.get("data") or data.get("candles") or data.get("result") or []
-    else:
-        rows = data
+    rows = data.get("data", data) if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        raise RuntimeError("Unexpected candle response from CoinDCX.")
+        raise RuntimeError("Unexpected candle response.")
     out = []
     for x in rows:
         if isinstance(x, dict):
@@ -128,7 +87,7 @@ def _parse_candles(data):
     ).sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=45, show_spinner=False)
 def get_klines(pair, timeframe, limit=500):
     now = int(time.time())
     url = f"{PUBLIC_BASE}/market_data/candlesticks"
@@ -143,8 +102,6 @@ def get_klines(pair, timeframe, limit=500):
         r.raise_for_status()
         raw = _parse_candles(r.json())
         raw["bucket"] = raw["time"].dt.floor(f"{bucket}min")
-        current_bucket = pd.Timestamp.now(tz="UTC").floor(f"{bucket}min")
-        raw = raw[raw["bucket"] < current_bucket]
         df = raw.groupby("bucket", sort=True).agg(
             open=("open", "first"), high=("high", "max"), low=("low", "min"),
             close=("close", "last"), volume=("volume", "sum"), count=("close", "size")
@@ -153,7 +110,7 @@ def get_klines(pair, timeframe, limit=500):
 
     if timeframe == "1D":
         r = SESSION.get(url, params={
-            "pair": pair, "from": now - max(int(limit) + 10, 40) * 86400,
+            "pair": pair, "from": now - max(int(limit) + 3, 3) * 86400,
             "to": now, "resolution": "1D", "pcode": "f"
         }, timeout=TIMEOUT)
         r.raise_for_status()
@@ -211,7 +168,7 @@ def transition_signal(df, up, down):
 
 
 def scan_rsi(pair, timeframe, period, ob, near_ob, os, near_os, volume):
-    df = get_klines(pair, timeframe, 180 if timeframe == "1D" else 300)
+    df = get_klines(pair, timeframe, RSI_1D_CANDLES if timeframe == "1D" else RSI_2M_CANDLES)
     if len(df) < period + 2:
         raise RuntimeError("Not enough completed candles for RSI.")
     value = float(rsi_wilder(df["close"], period).iloc[-1])
@@ -224,7 +181,7 @@ def scan_rsi(pair, timeframe, period, ob, near_ob, os, near_os, volume):
 
 
 def scan_ohlc(pair, volume):
-    m3 = get_klines(pair, "3m", 500)
+    m3 = get_klines(pair, "3m", OHLC_3M_CANDLES)
     daily = get_klines(pair, "1D", 10)
     up, down, prev = previous_day_levels(daily)
     found = transition_signal(m3, up, down)
@@ -250,7 +207,7 @@ def run_scan(strategy, universe, period, ob, near_ob, os, near_os):
             return {"__error__": True, "Pair": row["Pair"], "error": str(e)}
 
     results, errors = [], []
-    workers = 6 if strategy != "1D RSI" else 10
+    workers = SCAN_WORKERS_OHLC if strategy == "3M Previous-Day OHLC" else SCAN_WORKERS_RSI
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(worker, row) for _, row in universe.iterrows()]
         for f in as_completed(futures):
@@ -266,7 +223,7 @@ def run_scan(strategy, universe, period, ob, near_ob, os, near_os):
 def load_chart(pair, strategy, period, ob, near_ob, os, near_os):
     if strategy in ("2M RSI", "1D RSI"):
         tf = "2m" if strategy == "2M RSI" else "1D"
-        df = get_klines(pair, tf, 240 if tf == "2m" else 180)
+        df = get_klines(pair, tf, RSI_2M_CANDLES if tf == "2m" else RSI_1D_CANDLES)
         df["RSI"] = rsi_wilder(df["close"], period)
         return {"type": "rsi", "df": df}
     m3 = get_klines(pair, "3m", 360)
@@ -287,7 +244,7 @@ a {text-decoration:none;}
 
 for key, default in [
     ("watchlist", []), ("selected_coin", None), ("results", pd.DataFrame()),
-    ("scan_signature", None), ("scan_errors", []), ("last_scan_info", "Not scanned yet")
+    ("scan_signature", None), ("scan_errors", []), ("last_scan_info", "Not scanned yet"), ("last_scan_seconds", None)
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -341,19 +298,21 @@ if scan_now or st.session_state.scan_signature != signature:
         universe = get_symbols(int(top_coins))
         if volume_filter:
             universe = universe[universe["24h Volume"] >= min_volume_m * 1_000_000].copy()
-        with st.spinner(f"Scanning {len(universe)} coins..."):
+        scan_started = time.perf_counter()
+        with st.spinner(f"Fast scanning {len(universe)} coins..."):
             results, errors = run_scan(strategy, universe, int(rsi_period),
                                       float(overbought), float(near_overbought),
                                       float(oversold), float(near_oversold))
+        st.session_state.last_scan_seconds = round(time.perf_counter() - scan_started, 2)
         st.session_state.results = results
         st.session_state.scan_errors = errors
         st.session_state.scan_signature = signature
         st.session_state.last_scan_info = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception as e:
-        st.error(f"Scanner error: {type(e).__name__}: {e}")
+        st.error(f"Scanner error: {e}")
 
 st.title("📈 CoinDCX Strategy Scanner")
-st.caption("Simple live scanner • 📊 Show Chart below • ↗ External chart opens in a new tab")
+st.caption("Simple live scanner • 📊 Show Chart below • ↗ CoinDCX opens a new tab")
 
 df = st.session_state.results.copy()
 if not df.empty:
@@ -395,16 +354,8 @@ if not df.empty:
                 else:
                     st.session_state.watchlist.append(coin)
                 st.rerun()
-            if strategy == "2M RSI":
-                external_url = f"https://coindcx.com/futures/{pair}"
-                external_label = "↗ Open CoinDCX Futures"
-            else:
-                tv_symbol = pair.replace("B-", "").replace("_USDT", "") + "USDT"
-                tv_interval = "1D" if strategy == "1D RSI" else "3"
-                external_url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{tv_symbol}&interval={tv_interval}"
-                external_label = "↗ Open TradingView"
             st.markdown(
-                f'<a href="{external_url}" target="_blank">{external_label}</a>',
+                f'<a href="https://coindcx.com/futures/{pair}" target="_blank">↗ Open CoinDCX Futures</a>',
                 unsafe_allow_html=True
             )
 
@@ -422,16 +373,8 @@ if st.session_state.selected_coin:
     st.divider()
     h1, h2 = st.columns([5, 2])
     h1.subheader(f"📊 {coin} — {strategy}")
-    if strategy == "2M RSI":
-        chart_external_url = f"https://coindcx.com/futures/{pair}"
-        chart_external_label = "↗ Open CoinDCX Futures"
-    else:
-        tv_symbol = pair.replace("B-", "").replace("_USDT", "") + "USDT"
-        tv_interval = "1D" if strategy == "1D RSI" else "3"
-        chart_external_url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{tv_symbol}&interval={tv_interval}"
-        chart_external_label = "↗ Open TradingView"
     h2.markdown(
-        f'<a href="{chart_external_url}" target="_blank">{chart_external_label}</a>',
+        f'<a href="https://coindcx.com/futures/{pair}" target="_blank">↗ Open CoinDCX in New Tab</a>',
         unsafe_allow_html=True
     )
     if st.button("✕ Close Chart"):
