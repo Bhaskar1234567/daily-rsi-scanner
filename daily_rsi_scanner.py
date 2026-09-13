@@ -295,6 +295,48 @@ def load_chart(pair, strategy, period, ob, near_ob, os, near_os):
     return {"type": "ohlc", "df": m3, "long": float(up), "short": float(down), "prev": prev}
 
 
+# Background theme
+background_theme = st.sidebar.selectbox(
+    "Background",
+    ["White", "Black"],
+    index=0,
+)
+
+if background_theme == "Black":
+    st.markdown(
+        """
+        <style>
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+            background-color: #000000;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #111111;
+        }
+        .stApp, .stApp * {
+            color: #f5f5f5;
+        }
+        [data-testid="stSidebar"] * {
+            color: #f5f5f5;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        """
+        <style>
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+            background-color: #ffffff;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #f4f5f7;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 st.set_page_config(page_title="CoinDCX Strategy Scanner", page_icon="📈", layout="wide")
 
 st.markdown("""
