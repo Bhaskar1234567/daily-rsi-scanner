@@ -1,6 +1,3 @@
-streamlit
-pandas
-numpy
-requests
-streamlit-autorefresh
-plotly
+# This scanner uses only Python standard-library modules.
+# No pip packages are required.
+# Python 3.10 or newer is recommended.
